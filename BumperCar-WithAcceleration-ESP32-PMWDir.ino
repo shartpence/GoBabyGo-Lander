@@ -29,16 +29,25 @@ CytronMD motorRight(PWM_DIR, RIGHT_PWM_PIN, RIGHT_DIR_PIN); // Changed from Cytr
 
 // --- Joystick Calibration & Control Parameters ---
 int centerX, centerY;
-const int deadzone = 50; // Adjust as needed
+const int deadzone = 100; // Adjust as needed
 const int analogMax = 4095; // ESP32 ADC resolution (12-bit)
 
 // Ramping parameters
 const int accelerationRate = 5; // How much speed changes per loop iteration during acceleration
-const int decelerationRate = 10; // How much speed changes per loop iteration during deceleration
+const int decelerationRate = 40; // How much speed changes per loop iteration during deceleration
 
 // Current motor power levels (0-255 for full forward, -255 for full reverse)
 int currentLeftPower = 0;
 int currentRightPower = 0;
+
+// --- Filtering Parameters for live readings (Moving Average) ---
+const int FILTER_SAMPLES = 10; // Number of samples for the moving average filter
+int x_readings[FILTER_SAMPLES]; // Array to hold last X readings
+int y_readings[FILTER_SAMPLES]; // Array to hold last Y readings
+int x_read_index = 0; // Current index in the X array
+int y_read_index = 0; // Current index in the Y array
+long x_sum = 0; // Sum of X readings for average
+long y_sum = 0; // Sum of Y readings for average
 
 // Function to process raw joystick axis values
 int processAxis(int rawValue, int centerValue) {
@@ -57,14 +66,14 @@ int processAxis(int rawValue, int centerValue) {
   }
 }
 
-// Function to average analog readings for calibration
+// Function to average analog readings for calibration (used once in setup())
 int averageAnalog(int pin) {
   long sum = 0;
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < 100; i++) {
     sum += analogRead(pin);
-    delay(5);
+    delay(1); // Small delay to allow ADC to settle
   }
-  return sum / 10;
+  return sum / 100;
 }
 
 void setup() {
@@ -87,25 +96,45 @@ void setup() {
   Serial.println(centerY);
 
   // Initialize motors to neutral/stop state using the library
-  // The setSpeed(0) will send 0% duty cycle on PWM and the correct DIR state
   motorLeft.setSpeed(0);
   motorRight.setSpeed(0);
   delay(5000); // Small delay to ensure neutral is sent and MDDS30 is ready
 
   Serial.println("Setup Complete. Ready for joystick input.");
+
+  // --- Initialize filter arrays for loop() ---
+  // Fill filter arrays with initial center values to prevent glitches on startup
+  for (int i = 0; i < FILTER_SAMPLES; i++) {
+    x_readings[i] = centerX;
+    y_readings[i] = centerY;
+  }
+  x_sum = (long)centerX * FILTER_SAMPLES; // Cast to long to prevent overflow
+  y_sum = (long)centerY * FILTER_SAMPLES;
 }
 
 void loop() {
-  int rawX = analogRead(joystickXPin);
-  int rawY = analogRead(joystickYPin);
+  // --- Live Analog Read with Moving Average Filter ---
+  // Read new raw value from joystick
+  int newRawX = analogRead(joystickXPin);
+  int newRawY = analogRead(joystickYPin);
 
-  int x = processAxis(rawX, centerX);
-  int y = processAxis(rawY, centerY);
+  // Update the moving average filter for X-axis
+  x_sum = x_sum - x_readings[x_read_index] + newRawX; // Subtract oldest, add newest
+  x_readings[x_read_index] = newRawX; // Store newest reading
+  x_read_index = (x_read_index + 1) % FILTER_SAMPLES; // Move to next index (wraps around)
+  int filteredX = x_sum / FILTER_SAMPLES; // Calculate new average
+
+  // Update the moving average filter for Y-axis
+  y_sum = y_sum - y_readings[y_read_index] + newRawY;
+  y_readings[y_read_index] = newRawY;
+  y_read_index = (y_read_index + 1) % FILTER_SAMPLES;
+  int filteredY = y_sum / FILTER_SAMPLES;
+
+  // Use filtered values for processing
+  int x = processAxis(filteredX, centerX);
+  int y = processAxis(filteredY, centerY);
 
   // Calculate target power for each motor based on joystick input
-  // Differential drive logic:
-  // Forward/Backward (Y-axis) affects both
-  // Left/Right (X-axis) subtracts from one, adds to other for turning
   int targetLeftPower = constrain(y + x, -255, 255);
   int targetRightPower = constrain(y - x, -255, 255);
 
@@ -134,13 +163,23 @@ void loop() {
   currentLeftPower = constrain(currentLeftPower, -255, 255);
   currentRightPower = constrain(currentRightPower, -255, 255);
 
+  // --- IMPORTANT NEW BLOCK: Force stop if joystick is truly neutral ---
+  // This explicitly sets motor power to 0 if the processed (filtered and deadzoned)
+  // joystick input is exactly at the center. This should eliminate any lingering
+  // small signals that might keep one motor "on" according to the controller.
+  if (x == 0 && y == 0) {
+    currentLeftPower = 0;
+    currentRightPower = 0;
+  }
+
   // Set motor speed using the CytronMotorDriver library
-  // The library handles converting the -255 to 255 range to appropriate PWM/DIR signals
   motorLeft.setSpeed(currentLeftPower);
   motorRight.setSpeed(currentRightPower);
 
   // --- Debug Output ---
-  String debug = "RawX: " + String(rawX) + " | RawY: " + String(rawY) +
+  // Added filteredX and filteredY to debug output for monitoring
+  String debug = "RawX: " + String(newRawX) + " | RawY: " + String(newRawY) +
+                 " | FltX: " + String(filteredX) + " | FltY: " + String(filteredY) +
                  " | ProcX: " + String(x) + " | ProcY: " + String(y) +
                  " | TgtL: " + String(targetLeftPower) + " | TgtR: " + String(targetRightPower) +
                  " | CurrL: " + String(currentLeftPower) + " | CurrR: " + String(currentRightPower);
